@@ -143,6 +143,12 @@ sdrplay_source_c::~sdrplay_source_c() {
     }
     _uninit = true;
 
+    if (_fifo)
+    {
+        delete _fifo;
+        _fifo = NULL;
+    }
+
 }
 
 
