@@ -1,3 +1,19 @@
+
+******************************** FORK ***************************
+Warning: this is a fork of the official gr-osmosdr repo (For the official sources please go to http://sdr.osmocom.org/trac/wiki/GrOsmoSDR)
+This repo was created to maintain the sdrplay_source, so use on your own risk.
+
+To use the sdrplay_source you must compile with the option "-DENABLE_NONFREE=TRUE"
+
+git clone https://github.com/krippendorf/gr-osmosdr-fork-sdrplay.git
+cd gr-osmosdr-fork-sdrplay
+mkdir build
+cd build/
+cmake -DENABLE_NONFREE=TRUE ../
+make && sudo make install && sudo ldconfig
+
+******************************************************************
+
 While primarily being developed for the OsmoSDR hardware, this block
 as well supports:
 
