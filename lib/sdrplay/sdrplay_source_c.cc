@@ -139,7 +139,7 @@ sdrplay_source_c::~sdrplay_source_c() {
 
     if (_running) {
         _running = false;
-        mir_sdr_Uninit();
+        mir_sdr_StreamUninit();
     }
 
     if (_fifo)
