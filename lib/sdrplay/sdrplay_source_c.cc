@@ -110,7 +110,6 @@ sdrplay_source_c::sdrplay_source_c(const std::string &args)
                          gr::io_signature::make(MIN_IN, MAX_IN, sizeof(gr_complex)),
                          gr::io_signature::make(MIN_OUT, MAX_OUT, sizeof(gr_complex))),
           _running(false),
-          _uninit(false),
           _auto_gain(true) {
     _dev = (sdrplay_dev_t *) malloc(sizeof(sdrplay_dev_t));
     if (_dev == NULL) {
@@ -140,13 +139,11 @@ sdrplay_source_c::~sdrplay_source_c() {
 
     if (_running) {
         _running = false;
+        mir_sdr_Uninit();
     }
-    _uninit = true;
 
     if (_fifo)
     {
-        mir_sdr_Uninit();
-
         delete _fifo;
         _fifo = NULL;
     }
