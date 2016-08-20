@@ -307,7 +307,7 @@ double sdrplay_source_c::set_sample_rate(double rate) {
     std::cerr << "diff = " << diff << std::endl;
 
     if (_running) {
-        std::cerr << "reinit_device started" << std::endl;
+        _dev->reinitReson = mir_sdr_CHANGE_FS_FREQ;
         reinit_device();
 
     }
@@ -341,7 +341,6 @@ double sdrplay_source_c::set_center_freq(double freq, size_t chan) {
 
     if (_running) {
 
-        std::cerr << "reinit_device started" << std::endl;
         _dev->reinitReson = mir_sdr_CHANGE_RF_FREQ;
         reinit_device();
 
