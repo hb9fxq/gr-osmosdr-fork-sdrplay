@@ -145,6 +145,8 @@ sdrplay_source_c::~sdrplay_source_c() {
 
     if (_fifo)
     {
+        mir_sdr_Uninit();
+
         delete _fifo;
         _fifo = NULL;
     }
