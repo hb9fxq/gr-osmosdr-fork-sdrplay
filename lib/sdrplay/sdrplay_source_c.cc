@@ -58,6 +58,7 @@ struct sdrplay_dev {
     int dcMode;
     int agcSetPoint;
     int gRdBsystem;
+    int lnaEnable;
     mir_sdr_ReasonForReinitT reinitReson;
 };
 
@@ -122,12 +123,25 @@ sdrplay_source_c::sdrplay_source_c(const std::string &args)
     _dev->dcMode = 0;
     _dev->gRdB = 50;
     _dev->agcSetPoint = -30;
+    _dev->lnaEnable = 0;
     set_gain_limits(_dev->rfHz);
     _dev->gain_dB = _dev->maxGain - _dev->gRdB;
     _fifo = new boost::circular_buffer<gr_complex>(5000000);
 
-    reinit_device();
+    dict_t dict = params_to_dict(args);
 
+    if (dict.count("sdrplay")) {
+        if (dict.count("lna") && boost::lexical_cast<unsigned int>(dict["lna"])) {
+            _dev->lnaEnable = 1;
+            std::cerr << "LNA switched ON " << std::endl;
+
+        }
+        else {
+            std::cerr << "LNA switched OFF " << std::endl;
+        }
+    }
+
+    reinit_device();
 }
 
 /*
@@ -142,8 +156,7 @@ sdrplay_source_c::~sdrplay_source_c() {
         mir_sdr_StreamUninit();
     }
 
-    if (_fifo)
-    {
+    if (_fifo) {
         delete _fifo;
         _fifo = NULL;
     }
@@ -171,7 +184,7 @@ void sdrplay_source_c::reinit_device() {
         int grMode = 1;
 
         mir_sdr_Reinit(&_dev->gRdB, _dev->fsHz / 1e6, _dev->rfHz / 1e6, _dev->bwType, _dev->ifType, (mir_sdr_LoModeT) 1,
-                       0, &grMode, 1, &_dev->samplesPerPacket, _dev->reinitReson);
+                       _dev->lnaEnable, &grMode, 1, &_dev->samplesPerPacket, _dev->reinitReson);
 
     }
     else {
@@ -184,7 +197,8 @@ void sdrplay_source_c::reinit_device() {
         }
 
 
-        int err = mir_sdr_StreamInit(&_dev->gRdB, _dev->fsHz / 1e6, _dev->rfHz / 1e6, _dev->bwType, _dev->ifType, 0,
+        int err = mir_sdr_StreamInit(&_dev->gRdB, _dev->fsHz / 1e6, _dev->rfHz / 1e6, _dev->bwType, _dev->ifType,
+                                     _dev->lnaEnable,
                                      &_dev->gRdBsystem,
                                      1 /* use internal gr tables acording to band */, &_dev->samplesPerPacket,
                                      streamCallbackStatic,
@@ -475,7 +489,10 @@ void sdrplay_source_c::set_dc_offset(const std::complex<double> &offset, size_t 
 }
 
 double sdrplay_source_c::set_bandwidth(double bandwidth, size_t chan) {
-    if (bandwidth <= 200e3) _dev->bwType = mir_sdr_BW_0_200;
+
+    // default to 1.536
+    if (bandwidth <= .1) _dev->bwType = mir_sdr_BW_1_536;
+    else if (bandwidth <= 200e3) _dev->bwType = mir_sdr_BW_0_200;
     else if (bandwidth <= 300e3) _dev->bwType = mir_sdr_BW_0_300;
     else if (bandwidth <= 600e3) _dev->bwType = mir_sdr_BW_0_600;
     else if (bandwidth <= 1536e3) _dev->bwType = mir_sdr_BW_1_536;
