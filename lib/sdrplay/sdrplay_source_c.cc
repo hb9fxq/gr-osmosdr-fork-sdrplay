@@ -59,6 +59,7 @@ struct sdrplay_dev {
     int agcSetPoint;
     int gRdBsystem;
     int lnaEnable;
+    mir_sdr_AgcControlT agcControl;
     mir_sdr_ReasonForReinitT reinitReson;
 };
 
@@ -124,6 +125,7 @@ sdrplay_source_c::sdrplay_source_c(const std::string &args)
     _dev->gRdB = 50;
     _dev->agcSetPoint = -30;
     _dev->lnaEnable = 0;
+    _dev->agcControl = mir_sdr_AGC_100HZ;
     set_gain_limits(_dev->rfHz);
     _dev->gain_dB = _dev->maxGain - _dev->gRdB;
     _fifo = new boost::circular_buffer<gr_complex>(5000000);
@@ -134,10 +136,23 @@ sdrplay_source_c::sdrplay_source_c(const std::string &args)
         if (dict.count("lna") && boost::lexical_cast<unsigned int>(dict["lna"])) {
             _dev->lnaEnable = 1;
             std::cerr << "LNA switched ON " << std::endl;
-
         }
         else {
             std::cerr << "LNA switched OFF " << std::endl;
+        }
+        if (dict.count("agc-control")) {
+            unsigned int agcControl = boost::lexical_cast<unsigned int>(dict["agc-control"]);
+            if      (agcControl == 0)   _dev->agcControl = mir_sdr_AGC_DISABLE;
+            else if (agcControl == 5)   _dev->agcControl = mir_sdr_AGC_5HZ;
+            else if (agcControl == 50)  _dev->agcControl = mir_sdr_AGC_50HZ;
+            else                        _dev->agcControl = mir_sdr_AGC_100HZ;
+
+            set_gain_mode(_dev->agcControl,0);
+
+            std::cerr << "agcControl " << _dev->agcControl << std::endl;
+        }
+        else {
+            _dev->agcControl = mir_sdr_AGC_DISABLE;
         }
     }
 
@@ -168,10 +183,16 @@ void sdrplay_source_c::gcCallback(unsigned int gRdB, unsigned int lnaGRdB, void 
     return;
 }
 
+//unsigned long callCnt = 0;
 
 void sdrplay_source_c::streamCallbackStatic(short *xi, short *xq, unsigned int firstSampleNum, int grChanged,
                                             int rfChanged, int fsChanged, unsigned int numSamples, unsigned int reset,
                                             void *cbContext) {
+//    // Debugging
+//    callCnt++;
+//    if (callCnt % 10000 == 0)
+//        std::cerr << "streamCalbackStatic: " << callCnt / 10000 << std::endl;
+
     sdrplay_source_c *obj = (sdrplay_source_c *) cbContext;
     obj->streamCallback(xi, xq, firstSampleNum, grChanged, rfChanged, fsChanged, numSamples, reset);
 }
@@ -402,7 +423,7 @@ bool sdrplay_source_c::set_gain_mode(bool automatic, size_t chan) {
     _auto_gain = automatic;
     std::cerr << "automatic = " << automatic << std::endl;
 
-    mir_sdr_AgcControl(automatic, _dev->agcSetPoint, 0, 0, 0, 0, 0);
+    mir_sdr_AgcControl((automatic) ? _dev->agcControl : mir_sdr_AGC_DISABLE, _dev->agcSetPoint, 0, 0, 0, 0, _dev->lnaEnable);
 
     std::cerr << "set_gain_mode end" << std::endl;
     return get_gain_mode(chan);
@@ -541,8 +562,14 @@ osmosdr::freq_range_t sdrplay_source_c::get_bandwidth_range(size_t chan) {
     return range;
 }
 
+//long streamCnt = 0;
+
 void sdrplay_source_c::streamCallback(short *xi, short *xq, unsigned int firstSampleNum, int grChanged, int rfChanged,
                                       int fsChanged, unsigned int numSamples, unsigned int reset) {
+//    // Debugging
+//    streamCnt++;
+//    if (streamCnt % 10000 == 0)
+//        std::cerr << "streamCallback: " << streamCnt / 10000 << std::endl;
 
     size_t i;
     _fifo_lock.lock();
@@ -555,8 +582,6 @@ void sdrplay_source_c::streamCallback(short *xi, short *xq, unsigned int firstSa
 
     _fifo_lock.unlock();
     _samp_avail.notify_one();
-
-
 }
 
 
