@@ -31,7 +31,25 @@
  * Refactored many parts of the old source, mainly to support more features of the SDR play.
  * Requires the SDRPlay API Version 1.95
  *
+ *
+ * changes by Alex. Lichte, 2017:
+ * Extensions for RSP2: Antenna select (A, B, HI-Z), Bias (4.7V on B), AGC-Default=Off, LNA-Default=ON
+ * Requires the SDRPlay API Version 2.09
+ *
  */
+
+/* RSP2 LNA State    _dev->lnaEnable
+ * Band      0   1   2   3   4   5   6   7   8
+ * AM- Band-X   0   10   15   21   24   34   39   45   64(2)
+ * Band4/5   0   7   10   17   22   41(2)
+ * L Band   0   5   21   15(3)   15(3)   34(2)
+ * AM (Port 1)   0   6   12   18   37(2)
+ * (1) Mixer GR only
+ * (2) Includes LNA GR plus mixer GR
+ * (3) In LNAstate 3, external LNA GR only, in LNAstate 4, external plus internal LNA GR
+ */
+
+
 #ifdef HAVE_CONFIG_H
 
 #include "config.h"
@@ -45,8 +63,11 @@
 
 #define MAX_SUPPORTED_DEVICES   4
 
+
+
 struct sdrplay_dev {
-    int gRdB;
+    int gRdB_in;
+    int gRdB_out;
     double gain_dB;
     double fsHz;
     double rfHz;
@@ -58,10 +79,24 @@ struct sdrplay_dev {
     int dcMode;
     int agcSetPoint;
     int gRdBsystem;
-    int lnaEnable;
+    int lnaTreshold;
     mir_sdr_AgcControlT agcControl;
     mir_sdr_ReasonForReinitT reinitReson;
+    int antenna;
+    int antBias;
 };
+
+//typedef struct gcCallbackb gcCallbackb_t;
+
+
+struct gcCallbackb_t
+{
+  unsigned int done; // 1: Callback is ready
+  unsigned int gRdB;
+  unsigned int lnaGRdB;
+  void *cbContext;
+};
+gcCallbackb_t *gcCallbackb;
 
 using namespace boost::assign;
 
@@ -80,6 +115,14 @@ using namespace boost::assign;
 #define SDRPLAY_L_MAX     1675e6
 
 #define SDRPLAY_MAX_BUF_SIZE 504
+
+#define ANT_A    0
+#define ANT_B    1
+#define ANT_HI_Z 2
+
+#define DC_ONESHOT 4
+#define DC_SPEEDUP_ENABLED 1
+#define LNA_TRESH_DEF 29
 
 /*
  * Create a new instance of sdrplay_source_c and return
@@ -104,6 +147,10 @@ static const int MAX_IN = 0;    // maximum number of input streams
 static const int MIN_OUT = 1;    // minimum number of output streams
 static const int MAX_OUT = 1;    // maximum number of output streams
 
+std::vector<std::string> AntSel {"A", "B", "HI-Z"};
+
+
+
 /*
  * The private constructor
  */
@@ -112,34 +159,56 @@ sdrplay_source_c::sdrplay_source_c(const std::string &args)
                          gr::io_signature::make(MIN_IN, MAX_IN, sizeof(gr_complex)),
                          gr::io_signature::make(MIN_OUT, MAX_OUT, sizeof(gr_complex))),
           _running(false),
-          _auto_gain(true) {
+          _auto_gain(true)
+{
+    // unsigned int cnt; mir_sdr_DeviceT SDR_dev[MAX_SUPPORTED_DEVICES];
     _dev = (sdrplay_dev_t *) malloc(sizeof(sdrplay_dev_t));
     if (_dev == NULL) {
         return;
     }
-    _dev->fsHz = 2048e3;
+    gcCallbackb = (gcCallbackb_t *) malloc(sizeof(gcCallbackb_t));
+    if (gcCallbackb == NULL) {
+        return;
+    }
+      std::cerr << "Program arguments: " << args << std::endl;
+/*    mir_sdr_GetDevices(SDR_dev, &cnt, MAX_SUPPORTED_DEVICES);
+    if (cnt)
+      std::cerr << "Device found: " << SDR_dev[0].DevNm << std::endl;
+    else
+    {
+      std::cerr << "No Devices found" << std::endl;
+        return;
+    }
+    if (!SDR_dev[0].devAvail)
+    {
+      std::cerr << "Device bussy" << std::endl; // TODO: Switch to a second device with mir_sdr_SetDeviceIdx(1);
+      return;
+    }
+  */ 
+    _dev->fsHz = 2e6;
     _dev->rfHz = 96.8e6;
     _dev->bwType = mir_sdr_BW_1_536;
     _dev->ifType = mir_sdr_IF_Zero;
     _dev->dcMode = 0;
-    _dev->gRdB = 50;
+    _dev->gRdB_in = 80;
     _dev->agcSetPoint = -30;
-    _dev->lnaEnable = 0;
-    _dev->agcControl = mir_sdr_AGC_100HZ;
+    _dev->lnaTreshold = LNA_TRESH_DEF;
+    _dev->agcControl = mir_sdr_AGC_DISABLE;
     set_gain_limits(_dev->rfHz);
-    _dev->gain_dB = _dev->maxGain - _dev->gRdB;
+    _dev->gain_dB = _dev->maxGain - _dev->gRdB_in;
+    _dev->antBias = 0;
     _fifo = new boost::circular_buffer<gr_complex>(5000000);
 
     dict_t dict = params_to_dict(args);
 
-    if (dict.count("sdrplay")) {
-        if (dict.count("lna") && boost::lexical_cast<unsigned int>(dict["lna"])) {
-            _dev->lnaEnable = 1;
-            std::cerr << "LNA switched ON " << std::endl;
-        }
-        else {
-            std::cerr << "LNA switched OFF " << std::endl;
-        }
+    if (dict.count("sdrplay"))
+    {
+      if (dict.count("lna_tresh"))
+      {
+        _dev->lnaTreshold = (boost::lexical_cast<unsigned int>(dict["lna_tresh"]));
+        std::cerr << "LNA Treshold:  " << _dev->lnaTreshold << std::endl;   
+       
+      } 
         if (dict.count("agc-control")) {
             unsigned int agcControl = boost::lexical_cast<unsigned int>(dict["agc-control"]);
             if      (agcControl == 0)   _dev->agcControl = mir_sdr_AGC_DISABLE;
@@ -147,16 +216,21 @@ sdrplay_source_c::sdrplay_source_c(const std::string &args)
             else if (agcControl == 50)  _dev->agcControl = mir_sdr_AGC_50HZ;
             else                        _dev->agcControl = mir_sdr_AGC_100HZ;
 
-            set_gain_mode(_dev->agcControl,0);
-
             std::cerr << "agcControl " << _dev->agcControl << std::endl;
         }
-        else {
-            _dev->agcControl = mir_sdr_AGC_DISABLE;
-        }
+        set_gain_mode(_dev->agcControl,0);
+      if (dict.count("bias"))
+      {
+        _dev->antBias = (boost::lexical_cast<unsigned int>(dict["bias"]));
+        std::cerr << "Antenna bias:  " << _dev->antBias << std::endl;   
+      }
     }
-
+    _dev->reinitReson = (mir_sdr_ReasonForReinitT)0x7F;
     reinit_device();
+//    set_bandwidth(mir_sdr_BW_1_536,0);  // beter to reinit again ...
+    if (_dev->antBias) mir_sdr_RSPII_BiasTControl(_dev->antBias);  // better to call after init...
+    if(_dev->lnaTreshold != LNA_TRESH_DEF)
+      if (mir_sdr_SetGrParams(0,_dev->lnaTreshold)) std::cerr << "Settig LNA Treshold failed" << std::endl;
 }
 
 /*
@@ -179,7 +253,13 @@ sdrplay_source_c::~sdrplay_source_c() {
 }
 
 
-void sdrplay_source_c::gcCallback(unsigned int gRdB, unsigned int lnaGRdB, void *cbContext) {
+void sdrplay_source_c::gcCallback(unsigned int gRdB, unsigned int lnaGRdB, void *cbContext)
+{
+    std::cerr << "### gcCallback ### gRdB:  " << gRdB << "  lnaGRdB: " << lnaGRdB << "  cbContext: " << cbContext << std::endl;   
+    gcCallbackb->done = 1;
+    gcCallbackb->gRdB = gRdB;
+    gcCallbackb->lnaGRdB = lnaGRdB;
+    gcCallbackb->cbContext = cbContext;
     return;
 }
 
@@ -198,72 +278,63 @@ void sdrplay_source_c::streamCallbackStatic(short *xi, short *xq, unsigned int f
 }
 
 
-void sdrplay_source_c::reinit_device() {
-    std::cerr << "reinit_device started" << std::endl;
-
-    if (_running) {
-        int grMode = 1;
-
-        mir_sdr_Reinit(&_dev->gRdB, _dev->fsHz / 1e6, _dev->rfHz / 1e6, _dev->bwType, _dev->ifType, (mir_sdr_LoModeT) 1,
-                       _dev->lnaEnable, &grMode, 1, &_dev->samplesPerPacket, _dev->reinitReson);
-
+void sdrplay_source_c::reinit_device()
+{
+    int err, LNAstate=1;
+    std::cerr << "reinit_device started. Reason: 0x"  << std::hex << _dev->reinitReson << std::dec << "  gRdB: " << _dev->gRdB_in << std::endl;
+    if (_running)
+    {
+      _dev->gRdB_out = _dev->gRdB_in;
+      err = mir_sdr_Reinit(&_dev->gRdB_out, _dev->fsHz / 1e6, _dev->rfHz / 1e6, _dev->bwType, _dev->ifType, mir_sdr_LO_Auto,
+                     LNAstate, &_dev->gRdBsystem, mir_sdr_USE_SET_GR, &_dev->samplesPerPacket, _dev->reinitReson);
+      if (err != mir_sdr_Success)
+         std::cerr << "ReInit failed, code " << err << "  gRdB: " << _dev->gRdB_in  << "  gRdBsystem: " <<  _dev->gRdBsystem   << "  reinitReson: " << _dev->reinitReson  << std::endl;
     }
-    else {
+    else
+    {
+      mir_sdr_DebugEnable(1);
+      std::cerr << "before stream init" << std::endl;
 
-        std::cerr << "before stream init" << std::endl;
-
-        if (_dev->dcMode) {
-            std::cerr << "mir_sdr_SetDcMode started" << std::endl;
-            mir_sdr_SetDcMode(4, 1);
-        }
-
-
-        int err = mir_sdr_StreamInit(&_dev->gRdB, _dev->fsHz / 1e6, _dev->rfHz / 1e6, _dev->bwType, _dev->ifType,
-                                     _dev->lnaEnable,
+      if (_dev->dcMode)
+      {
+        std::cerr << "mir_sdr_SetDcMode started" << std::endl;
+   mir_sdr_SetDcMode(DC_ONESHOT, DC_SPEEDUP_ENABLED);
+      }
+      _dev->gRdB_out = _dev->gRdB_in;
+      err = mir_sdr_StreamInit(&_dev->gRdB_out, _dev->fsHz / 1e6, _dev->rfHz / 1e6, _dev->bwType, _dev->ifType,
+                                     LNAstate,
                                      &_dev->gRdBsystem,
-                                     1 /* use internal gr tables acording to band */, &_dev->samplesPerPacket,
+                                     mir_sdr_USE_SET_GR,
+                                     &_dev->samplesPerPacket,
                                      streamCallbackStatic,
                                      gcCallback, (void *) this);
 
-        if (err != mir_sdr_Success) {
-            std::cerr << "StreamInit failed, code " << err << std::endl;
-            exit(1);
-        }
-
-        _running = true;
-
-        std::cerr << "after stream init: 1" << std::endl;
+      if (err != mir_sdr_Success)
+      {
+         std::cerr << "StreamInit failed, code " << err << std::endl;
+         return;
+      }
+      _running = true;
+      std::cerr << "after stream init: 1" << std::endl;
     }
-
-    set_gain_limits(_dev->rfHz);
-    _dev->gain_dB = _dev->maxGain - _dev->gRdB;
-
-    std::cerr << "reinit_device end" << std::endl;
+    usleep(1000);
+    mir_sdr_ResetUpdateFlags(1,1,1);
+    std::cerr << "reinit_device end - gainVals.current: " << _dev->gRdB_out << std::endl;
 }
 
-void sdrplay_source_c::set_gain_limits(double freq) {
-
-    if (freq <= SDRPLAY_AM_MAX) {
-        _dev->minGain = -4;
-        _dev->maxGain = 98;
-    }
-    else if (freq <= SDRPLAY_FM_MAX) {
-        _dev->minGain = 1;
-        _dev->maxGain = 103;
-    }
-    else if (freq <= SDRPLAY_B3_MAX) {
-        _dev->minGain = 5;
-        _dev->maxGain = 107;
-    }
-    else if (freq <= SDRPLAY_B45_MAX) {
-        _dev->minGain = 9;
-        _dev->maxGain = 94;
-    }
-    else if (freq <= SDRPLAY_L_MAX) {
-        _dev->minGain = 24;
-        _dev->maxGain = 105;
-    }
-
+void sdrplay_source_c::set_gain_limits(double freq)
+{
+  int err;
+  mir_sdr_GainValuesT limits;
+  err=mir_sdr_GetCurrentGain(&limits);
+  _dev->maxGain = (int)limits.max;
+  _dev->minGain = (int)limits.min;
+  if (err != mir_sdr_Success)
+  {
+    _dev->minGain = 20;
+    _dev->maxGain = 70;
+  }
+  std::cerr << "Gain:  error: " << err <<  "  min: " << _dev->minGain << "  max: " <<  _dev->maxGain << std::endl;
 }
 
 int sdrplay_source_c::work(int noutput_items,
@@ -294,29 +365,34 @@ int sdrplay_source_c::work(int noutput_items,
 
 std::vector<std::string> sdrplay_source_c::get_devices() {
     std::vector<std::string> devices;
-    std::cerr << "get_devices started" << std::endl;
-
+    unsigned int i, cnt; mir_sdr_DeviceT SDR_dev[MAX_SUPPORTED_DEVICES];
     unsigned int dev_cnt = 0;
-    int samplesPerPacket;
 
-    /*FIXEM: this methods might no longer work in future, look for alternatives... */
-    while (mir_sdr_Init(60, 2.048, 200.0, mir_sdr_BW_1_536, mir_sdr_IF_Zero, &samplesPerPacket) == mir_sdr_Success) {
-        dev_cnt++;
+    mir_sdr_GetDevices(SDR_dev, &cnt, MAX_SUPPORTED_DEVICES);
+   
+    for(i=0; i<MAX_SUPPORTED_DEVICES; i++)
+    {
+   
+      if (cnt)
+      {
+        std::cerr << "Device found: " << SDR_dev[i].DevNm << std::endl;
+        if (SDR_dev[i].devAvail)
+   {
+     dev_cnt++;
+          std::string args = "sdrplay=" + boost::lexical_cast<std::string>(i);
+          args += ",label='" + std::string("SDRplay RSP") + "'";
+          std::cerr << args << std::endl;
+          devices.push_back(args);
+   }
+        else std::cerr << "Device bussy" << std::endl;
+        cnt--;
+      }
     }
-
-    std::cerr << "Device count: " << dev_cnt << std::endl;
-
-    for (unsigned int i = 0; i < dev_cnt; i++) {
-        mir_sdr_Uninit();
-        std::string args = "sdrplay=" + boost::lexical_cast<std::string>(i);
-        args += ",label='" + std::string("SDRplay RSP") + "'";
-        std::cerr << args << std::endl;
-        devices.push_back(args);
+    if (!dev_cnt)
+    {
+      std::cerr << "No Devices available" << std::endl;
     }
-
-    std::cerr << "get_devices end" << std::endl;
     return devices;
-
 }
 
 size_t sdrplay_source_c::get_num_channels() {
@@ -375,9 +451,9 @@ double sdrplay_source_c::set_center_freq(double freq, size_t chan) {
 
     if (_running) {
 
-        _dev->reinitReson = mir_sdr_CHANGE_RF_FREQ;
+        _dev->reinitReson = (mir_sdr_ReasonForReinitT)(mir_sdr_CHANGE_RF_FREQ/*|mir_sdr_CHANGE_GR*/);
+        gcCallbackb->done = 0;
         reinit_device();
-
     }
 
     std::cerr << "set_center_freq end" << std::endl;
@@ -419,11 +495,12 @@ osmosdr::gain_range_t sdrplay_source_c::get_gain_range(const std::string &name, 
 }
 
 bool sdrplay_source_c::set_gain_mode(bool automatic, size_t chan) {
+    int LNAstate=1;
     std::cerr << "set_gain_mode started" << std::endl;
     _auto_gain = automatic;
     std::cerr << "automatic = " << automatic << std::endl;
 
-    mir_sdr_AgcControl((automatic) ? _dev->agcControl : mir_sdr_AGC_DISABLE, _dev->agcSetPoint, 0, 0, 0, 0, _dev->lnaEnable);
+    mir_sdr_AgcControl((automatic) ? _dev->agcControl : mir_sdr_AGC_DISABLE, _dev->agcSetPoint, 0, 0, 0, 0, LNAstate);
 
     std::cerr << "set_gain_mode end" << std::endl;
     return get_gain_mode(chan);
@@ -435,21 +512,23 @@ bool sdrplay_source_c::get_gain_mode(size_t chan) {
 
 double sdrplay_source_c::set_gain(double gain, size_t chan) {
     std::cerr << "set_gain started" << std::endl;
+    set_gain_limits(_dev->rfHz);
     _dev->agcSetPoint = gain;
-    std::cerr << "gain = " << gain << std::endl;
     if (gain < _dev->minGain) {
         _dev->gain_dB = _dev->minGain;
-    }
+    } else
     if (gain > _dev->maxGain) {
         _dev->gain_dB = _dev->maxGain;
-    }
-    _dev->gRdB = (int) (_dev->maxGain - gain);
-
-    if (_running) {
-        _dev->reinitReson = mir_sdr_CHANGE_GR;
-        std::cerr << "mir_sdr_SetGr started" << std::endl;
-        reinit_device();
-    }
+    } else _dev->gain_dB = gain;
+    std::cerr << "gain = " << _dev->gain_dB << std::endl;
+    _dev->gRdB_in = (int) (_dev->maxGain - _dev->gain_dB);
+    if (_running)
+    {
+      mir_sdr_SetGr(_dev->gRdB_in, 1, 0);
+/*      _dev->reinitReson = (mir_sdr_ReasonForReinitT)(mir_sdr_CHANGE_GR|mir_sdr_CHANGE_BW_TYPE  );
+      std::cerr << "mir_sdr_SetGr started with gRdB (maxGain - gain): " << _dev->gRdB_in << std::endl;
+      reinit_device();
+*/    }
 
     std::cerr << "set_gain end" << std::endl;
     return get_gain(chan);
@@ -467,40 +546,61 @@ double sdrplay_source_c::get_gain(const std::string &name, size_t chan) {
     return get_gain(chan);
 }
 
-std::vector<std::string> sdrplay_source_c::get_antennas(size_t chan) {
-    std::vector<std::string> antennas;
-
-    antennas += get_antenna(chan);
-
-    return antennas;
+std::vector<std::string> sdrplay_source_c::get_antennas(size_t chan)
+{
+   //return {"A", "B", "HI-Z"};
+   return AntSel;
 }
 
 std::string sdrplay_source_c::set_antenna(const std::string &antenna, size_t chan) {
-    return get_antenna(chan);
+   int do_reinit;
+   if (antenna == "HI-Z")
+   {
+     _dev->antenna = ANT_HI_Z;
+     mir_sdr_AmPortSelect(1);
+     _dev->reinitReson = mir_sdr_CHANGE_AM_PORT;
+     sdrplay_source_c::reinit_device();
+   } 
+   else
+   { 
+     if (_dev->antenna == ANT_HI_Z)  do_reinit = 1; else do_reinit = 0;
+     if (antenna == "B") { _dev->antenna = ANT_B; mir_sdr_RSPII_AntennaControl(mir_sdr_RSPII_ANTENNA_B);}
+     else {_dev->antenna = ANT_A;  mir_sdr_RSPII_AntennaControl(mir_sdr_RSPII_ANTENNA_A);}
+     if (do_reinit)
+     {
+       mir_sdr_AmPortSelect(0);
+       _dev->reinitReson = mir_sdr_CHANGE_AM_PORT;
+       sdrplay_source_c::reinit_device();
+     }
+   }
+   std::cerr << "set_antenna = " << AntSel.at(_dev->antenna) << std::endl;
+   return get_antenna( chan );
 }
 
 std::string sdrplay_source_c::get_antenna(size_t chan) {
-    return "RX";
+    std::cerr << "get_antenna = " << AntSel.at(_dev->antenna) << std::endl;
+    return AntSel.at(_dev->antenna);
 }
 
 void sdrplay_source_c::set_dc_offset_mode(int mode, size_t chan) {
     if (osmosdr::source::DCOffsetOff == mode) {
         _dev->dcMode = 0;
         if (_running) {
-            mir_sdr_SetDcMode(4, 1);
+            mir_sdr_SetDcMode(DC_ONESHOT, DC_SPEEDUP_ENABLED);
         }
     }
     else if (osmosdr::source::DCOffsetManual == mode) {
         std::cerr << "Manual DC correction mode is not implemented." << std::endl;
         _dev->dcMode = 0;
         if (_running) {
-            mir_sdr_SetDcMode(4, 1);
+            mir_sdr_SetDcMode(DC_ONESHOT, DC_SPEEDUP_ENABLED);
         }
     }
     else if (osmosdr::source::DCOffsetAutomatic == mode) {
         _dev->dcMode = 1;
+        std::cerr << "DC correction enabled" << std::endl;
         if (_running) {
-            mir_sdr_SetDcMode(4, 1);
+            mir_sdr_SetDcMode(DC_ONESHOT, DC_SPEEDUP_ENABLED);
         }
     }
 }
@@ -528,6 +628,7 @@ double sdrplay_source_c::set_bandwidth(double bandwidth, size_t chan) {
         std::cerr << "set_bandwidth running" << std::endl;
         _dev->reinitReson = mir_sdr_CHANGE_BW_TYPE;
         reinit_device();
+   set_gain(get_gain(0));
     }
 
     return get_bandwidth(chan);
